@@ -69,7 +69,7 @@ class NN(var useBCE: Boolean = true) {
     a2
   }
 
-  def backward(gt: DenseMatrix[Double], debug: Boolean = false): Unit = {
+  def backward(gt: DenseMatrix[Double], debug: Boolean = false): Option[(DenseMatrix[Double], DenseMatrix[Double])] = {
     // gt is the ground-truth (true label)
     if (useBCE) {
       // compute loss
@@ -106,7 +106,9 @@ class NN(var useBCE: Boolean = true) {
       if(debug) {println("dw1=\n" + dw1)}
 
       // return gradients
-      (dw1, dw2)
+      Some(dw1, dw2)
+    } else {
+      None
     }
   }
 }
