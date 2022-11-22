@@ -6,6 +6,7 @@
 
 import org.apache.spark.graphx.{Graph, VertexId, PartitionStrategy, VertexRDD}
 import org.apache.spark.graphx.util.GraphGenerators
+import org.apache.spark.rdd.RDD
 import scala.util.Random
 import breeze.linalg._
 import breeze.stats.distributions.Gaussian
@@ -31,7 +32,7 @@ w1(-1, ::) := 0.0 // bias set to 0
 var w2 = (DenseMatrix.rand(nHid + 1, nOut) - 0.5) / sqrt(nHid + 1)
 w2(-1, ::) := 0.0 // bias set to 0
 
-class NN(var useBCE: Boolean = true) {
+class NN(var useBCE: Boolean = true) {//! DEPRECATED
 
   // values we should cache for the backpropagation
   var in: DenseMatrix[Double] = _
@@ -111,21 +112,27 @@ nn.backward(yt, w1, w2, true) // only works after the forward
 class LearningData(var features: DenseVector[Double], var label: Double)
 
 // some definitions //? do we need it?
-class ParentVertexProperty()
+trait ParentVertexProperty //! declaring ParentVertexProperty as a class does not work when spark tries to deserialize PArameterVertexProperty
 case class DataVertexProperty(
   val data: LearningData // or val data: (DenseVector[Double], Double)
 ) extends ParentVertexProperty
 case class ParameterVertexProperty(
-  val w1: DenseMatrix[Double],
-  val w2: DenseMatrix[Double],
+  var w1: Option[DenseMatrix[Double]] = None,
+  var w2: Option[DenseMatrix[Double]] = None,
   // val lr: Double, //? do we need it?
-  var nn: NN
-)  extends ParentVertexProperty
+  // Variables for backpropagation:
+  var in: Option[DenseMatrix[Double]] = None,
+  var z1: Option[DenseMatrix[Double]] = None,
+  var a1: Option[DenseMatrix[Double]] = None,
+  var z2: Option[DenseMatrix[Double]] = None,
+  var a2: Option[DenseMatrix[Double]] = None
+) extends ParentVertexProperty
 
 
 // -----------------------------------------------------------------------------
 // 3.1 create our single graph with both Data and Parameter vertices
 // -----------------------------------------------------------------------------
+
 // 3.1.1 - Create data vertices, annotated with features and labels
 val dataGraph: Graph[LearningData, Int] =
   GraphGenerators.logNormalGraph(sc, numVertices = 100).mapVertices( // obs: may have "recursive edges""
@@ -139,6 +146,7 @@ val dataGraph: Graph[LearningData, Int] =
       data
     }
   )
+  
 // 3.1.2 - Make the dataGraph undirected (in GraphX, this means duplicating+reversing all edges)
 var graph = Graph.apply(
   vertices=dataGraph.vertices,
@@ -163,20 +171,33 @@ val batchSize = 4 //TODO change to 512 with big dataset
 // plus an "ID" computed as k*nPart + i, where 0 <= i < nPartitions is the partition where the vertices composing the
 // list are co-located and k is the counter of this list of vertices within the partition
 // (we will use this "ID" below to build the parameter Nodes and know which vertices point to it)
-var groupedVertices =  graph.vertices.map(x => (x._1 * mixingPrime % nPartitions, x._1))
-                            .groupByKey()
-                            .map(x => (x._1, x._2.grouped(batchSize).toList))
-                            .flatMap(x => {
+var groupedVertices =  graph.vertices.map(x => (x._1 * mixingPrime % nPartitions, x._1)).
+                            groupByKey().
+                            map(x => (x._1, x._2.grouped(batchSize).toList)).
+                            flatMap(x => {
                               for ((innerList, k) <- x._2.zipWithIndex) yield (k * nPartitions + x._1, innerList)
                               }
                             )
-// 3.1.3.2 - Here, we finally create the parameter vertices, build a new graph with both them and the already
-// existing data nodes, then repartition by the dst Id of all vertices.
+// 3.1.3.2 - create the parameter vertices.
 val maxDataVertexId = graph.vertices.map(x => x._1).max
 // smallest multiple of nPartitions that doesn't coincide with any data vertex id:
 val parameterVertexOffset = nPartitions * (maxDataVertexId / nPartitions + 1)
-//TODO I'M HERE
-
+// create the parameter vertices properly said
+val vrdd: RDD[(VertexId, ParameterVertexProperty)] = groupedVertices.map(x => {
+    // Kaiming He initialization for layer with ReLU:
+    val gaussianSampler = Gaussian(0, sqrt(2.0 / nIn))
+    var w1 = DenseMatrix.tabulate(nIn, nHid){(i,j) => gaussianSampler.sample(1)(0)}
+    w1(-1, ::) := 0.0 // bias set to 0
+    // Xavier Glorot initialization for layer with sigmoid:
+    var w2 = (DenseMatrix.rand(nHid + 1, nOut) - 0.5) / sqrt(nHid + 1)
+    w2(-1, ::) := 0.0 // bias set to 0
+    val data = ParameterVertexProperty(Some(w1), Some(w2))
+    (x._1 + parameterVertexOffset, data)
+  }
+)
+val parameterVertices: VertexRDD[ParameterVertexProperty] = VertexRDD(vrdd)  // convert to VertexRDD format
+// 3.1.3.3 - build a new graph with both parameter and data nodes
+// TODO <- I'M HERE
 
 // 3.1.4 - Partition the graph so that all edges point to the same node are together
 // (partition by dst vertex id)
