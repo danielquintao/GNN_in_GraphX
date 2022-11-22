@@ -4,7 +4,7 @@
 // For the moment, create a fake graph with fake features and labels
 // =============================================================================
 
-import org.apache.spark.graphx.{Graph, VertexId, PartitionStrategy}
+import org.apache.spark.graphx.{Graph, VertexId, PartitionStrategy, VertexRDD}
 import org.apache.spark.graphx.util.GraphGenerators
 import scala.util.Random
 import breeze.linalg._
@@ -40,7 +40,7 @@ class NN(var useBCE: Boolean = true) {
   var z2: DenseMatrix[Double] = _
   var a2: DenseMatrix[Double] = _
 
-  def forward(input: DenseMatrix[Double], debug: Boolean = false): DenseMatrix[Double] = {
+  def forward(input: DenseMatrix[Double], w1: DenseMatrix[Double], w2: DenseMatrix[Double], debug: Boolean = false): DenseMatrix[Double] = {
     in = input
     z1 = input * w1  // matrix product
     if (debug) println("z1=\n" + z1)
@@ -54,7 +54,7 @@ class NN(var useBCE: Boolean = true) {
     a2
   }
 
-  def backward(gt: DenseMatrix[Double], debug: Boolean = false): Option[(DenseMatrix[Double], DenseMatrix[Double])] = {
+  def backward(gt: DenseMatrix[Double], w1: DenseMatrix[Double], w2: DenseMatrix[Double],  debug: Boolean = false): Option[(DenseMatrix[Double], DenseMatrix[Double])] = {
     // gt is the ground-truth (true label)
     if (useBCE) {
       // compute loss
@@ -101,19 +101,21 @@ val nn = new NN()
 val x = DenseMatrix.rand(5, nIn)  // fake input
 val yt = DenseMatrix.ones[Double](5, nOut)  // fake true labels
 yt(DenseMatrix.rand(5, nOut) <:< 0.5) := 0.0
-nn.forward(x, true)
-nn.backward(yt, true) // only works after the forward
+nn.forward(x, w1, w2, true)
+nn.backward(yt, w1, w2, true) // only works after the forward
 
 // =============================================================================
 // 3- Generation of our super graph with data nodes and parameter nodes
 // =============================================================================
+
+class LearningData(var features: DenseVector[Double], var label: Double)
 
 // some definitions //? do we need it?
 class ParentVertexProperty()
 case class DataVertexProperty(
   val data: LearningData // or val data: (DenseVector[Double], Double)
 ) extends ParentVertexProperty
-case class ParamVertexProperty(
+case class ParameterVertexProperty(
   val w1: DenseMatrix[Double],
   val w2: DenseMatrix[Double],
   // val lr: Double, //? do we need it?
@@ -125,7 +127,6 @@ case class ParamVertexProperty(
 // 3.1 create our single graph with both Data and Parameter vertices
 // -----------------------------------------------------------------------------
 // 3.1.1 - Create data vertices, annotated with features and labels
-class LearningData(var features: DenseVector[Double], var label: Double)
 val dataGraph: Graph[LearningData, Int] =
   GraphGenerators.logNormalGraph(sc, numVertices = 100).mapVertices( // obs: may have "recursive edges""
     (_, _) => {
@@ -151,13 +152,31 @@ graph = graph.groupEdges{case (ed1, ed2) => ed1} // edges have no relevant annot
 //                                                  so we simply take the first one 
 
 
-// 3.1.3 - Add parameter vertices where each has "batch-size" inward data->parameter edges.
+// 3.1.3 - Add parameter vertices where each has "batch-size" data->parameter edges.
 // A further improvement on the Routing Table (where GraphX says, for each vertex, in which partitions
 // we find its edges) is to use a constraint on the IDs of those data vertices that point toward the
 // the parameter vertex, e.g. that they are all congruent mod "nb partitions".
 val nPartitions = graph.edges.getNumPartitions
+val mixingPrime: VertexId = 1125899906842597L //* MUST BE THE SAME USED BY PartitionStrategy, c.f. https://github.com/apache/spark/blob/v3.3.1/graphx/src/main/scala/org/apache/spark/graphx/PartitionStrategy.scala
 val batchSize = 4 //TODO change to 512 with big dataset
-// TODO <-- PAREI AQUI
+// 3.1.3.1 - The idea here is to have an RDD where each entry is a list of AT MOST batchSize vertices FROM THE SAME PARTITION
+// plus an "ID" computed as k*nPart + i, where 0 <= i < nPartitions is the partition where the vertices composing the
+// list are co-located and k is the counter of this list of vertices within the partition
+// (we will use this "ID" below to build the parameter Nodes and know which vertices point to it)
+var groupedVertices =  graph.vertices.map(x => (x._1 * mixingPrime % nPartitions, x._1))
+                            .groupByKey()
+                            .map(x => (x._1, x._2.grouped(batchSize).toList))
+                            .flatMap(x => {
+                              for ((innerList, k) <- x._2.zipWithIndex) yield (k * nPartitions + x._1, innerList)
+                              }
+                            )
+// 3.1.3.2 - Here, we finally create the parameter vertices, build a new graph with both them and the already
+// existing data nodes, then repartition by the dst Id of all vertices.
+val maxDataVertexId = graph.vertices.map(x => x._1).max
+// smallest multiple of nPartitions that doesn't coincide with any data vertex id:
+val parameterVertexOffset = nPartitions * (maxDataVertexId / nPartitions + 1)
+//TODO I'M HERE
+
 
 // 3.1.4 - Partition the graph so that all edges point to the same node are together
 // (partition by dst vertex id)
