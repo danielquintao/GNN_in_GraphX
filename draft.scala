@@ -4,7 +4,7 @@
 // For the moment, create a fake graph with fake features and labels
 // =============================================================================
 
-import org.apache.spark.graphx.{Graph, VertexId, PartitionStrategy, VertexRDD}
+import org.apache.spark.graphx.{Graph, VertexId, PartitionStrategy, VertexRDD, Edge}
 import org.apache.spark.graphx.util.GraphGenerators
 import org.apache.spark.rdd.RDD
 import scala.util.Random
@@ -109,7 +109,9 @@ nn.backward(yt, w1, w2, true) // only works after the forward
 // 3- Generation of our super graph with data nodes and parameter nodes
 // =============================================================================
 
-class LearningData(var features: DenseVector[Double], var label: Double)
+// language note: case classes extend Serializable by default (which we'll need)
+
+case class LearningData(var features: DenseVector[Double], var label: Double)
 
 // some definitions //? do we need it?
 trait ParentVertexProperty //! declaring ParentVertexProperty as a class does not work when spark tries to deserialize PArameterVertexProperty
@@ -134,7 +136,7 @@ case class ParameterVertexProperty(
 // -----------------------------------------------------------------------------
 
 // 3.1.1 - Create data vertices, annotated with features and labels
-val dataGraph: Graph[LearningData, Int] =
+val dataGraph: Graph[DataVertexProperty, Int] =
   GraphGenerators.logNormalGraph(sc, numVertices = 100).mapVertices( // obs: may have "recursive edges""
     (_, _) => {
       var data = new
@@ -143,7 +145,7 @@ val dataGraph: Graph[LearningData, Int] =
           randomInt()  // 0 or 1
         )
       data.features(-1) = 1  // bias 
-      data
+      DataVertexProperty(data)
     }
   )
   
@@ -197,7 +199,17 @@ val vrdd: RDD[(VertexId, ParameterVertexProperty)] = groupedVertices.map(x => {
 )
 val parameterVertices: VertexRDD[ParameterVertexProperty] = VertexRDD(vrdd)  // convert to VertexRDD format
 // 3.1.3.3 - build a new graph with both parameter and data nodes
-// TODO <- I'M HERE
+// convert property type of parameterVertices to ParentVectorProperty
+val pV: RDD[(VertexId, ParentVertexProperty)] = parameterVertices.map(x => (x._1, x._2.asInstanceOf[ParentVertexProperty]))
+graph = Graph.apply(
+  // convert property type of vertices of graph (so far, these are data vertices) to ParentVectorProperty
+  // and merge with the parameter vertices recently converted to same type :)
+  vertices = pV.union(graph.mapVertices((vId, dataVP) => dataVP.asInstanceOf[ParentVertexProperty]).vertices),
+  // edges are the original data edges, and edges linking
+  edges = pV.map(x => (x._1 - parameterVertexOffset, x._2)).join(groupedVertices).flatMap(x => {
+    for (dataVertexId <- x._2._2) yield new Edge[None.type] (dataVertexId, x._1 + parameterVertexOffset)
+  })
+)
 
 // 3.1.4 - Partition the graph so that all edges point to the same node are together
 // (partition by dst vertex id)
