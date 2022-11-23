@@ -208,11 +208,13 @@ graph = Graph.apply(
   // edges are the original data edges, and edges linking
   edges = pV.map(x => (x._1 - parameterVertexOffset, x._2)).join(groupedVertices).flatMap(x => {
     for (dataVertexId <- x._2._2) yield new Edge[None.type] (dataVertexId, x._1 + parameterVertexOffset)
-  })
+  }) ++ dataGraph.edges.map(x => new Edge[None.type](x.srcId, x.dstId))
 )
 
 // 3.1.4 - Partition the graph so that all edges point to the same node are together
 // (partition by dst vertex id)
+//! TODO test with and without this optim
+
 
 //! ATTENTION it seems that GraphSage was made for undirected graphs, so we need to replicate all
 //! nodes in our **data** graph
