@@ -4,7 +4,7 @@
 // For the moment, create a fake graph with fake features and labels
 // =============================================================================
 
-import org.apache.spark.graphx.{Graph, VertexId, PartitionStrategy, VertexRDD, Edge}
+import org.apache.spark.graphx.{Graph, VertexId, PartitionStrategy, VertexRDD, Edge, PartitionID}
 import org.apache.spark.graphx.util.GraphGenerators
 import org.apache.spark.rdd.RDD
 import scala.util.Random
@@ -201,7 +201,7 @@ val parameterVertices: VertexRDD[ParameterVertexProperty] = VertexRDD(vrdd)  // 
 // 3.1.3.3 - build a new graph with both parameter and data nodes
 // convert property type of parameterVertices to ParentVectorProperty
 val pV: RDD[(VertexId, ParentVertexProperty)] = parameterVertices.map(x => (x._1, x._2.asInstanceOf[ParentVertexProperty]))
-graph = Graph.apply(
+var combinedGraph = Graph.apply(
   // convert property type of vertices of graph (so far, these are data vertices) to ParentVectorProperty
   // and merge with the parameter vertices recently converted to same type :)
   vertices = pV.union(graph.mapVertices((vId, dataVP) => dataVP.asInstanceOf[ParentVertexProperty]).vertices),
@@ -214,6 +214,20 @@ graph = Graph.apply(
 // 3.1.4 - Partition the graph so that all edges point to the same node are together
 // (partition by dst vertex id)
 //! TODO test with and without this optim
+// we need to create our custom partition, co-locating edges with the same DESTINATION
+// (because of our use case, this seems the best option). 
+// We might try built-in CanonicalRandomVertexCut too (which is defined by GraphX itself).
+// Recall that we even build the parameter vertices with smart id numbers in order to improve even
+// further the partition (by co-locating parameter and data vertices)
+// NOTE: c.f. https://github.com/apache/spark/blob/v3.3.1/graphx/src/main/scala/org/apache/spark/graphx/PartitionStrategy.scala
+// to see how we define new Partitions (EdgePartition1D is the "dual" or our strategy, i.e. using src instead of dst)
+object PartitionOnDst extends PartitionStrategy {
+  override def getPartition(src: VertexId, dst: VertexId, numParts: PartitionID): PartitionID = {
+    val mixingPrime: VertexId = 1125899906842597L
+    (math.abs(dst * mixingPrime) % numParts).toInt
+  }
+}
+combinedGraph = combinedGraph.partitionBy(PartitionOnDst)
 
 
 //! ATTENTION it seems that GraphSage was made for undirected graphs, so we need to replicate all
