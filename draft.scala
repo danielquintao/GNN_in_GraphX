@@ -22,7 +22,7 @@ import scala.math.{log, exp, sqrt}
 // -----------------------------------------------------------------------------
 
 // language note: case classes extend Serializable by default (which we'll need)
-case class LearningData(var features: DenseVector[Double], var label: Double)
+case class LearningData(var features: DenseVector[Double], var label: DenseVector[Double]) //! CHANGED label FROM Double TO DenseVector
 
 trait ParentVertexProperty //! declaring ParentVertexProperty as a class does not work when spark tries to deserialize PArameterVertexProperty
 case class DataVertexProperty(
@@ -40,17 +40,19 @@ case class ParameterVertexProperty(
   var a2: Option[DenseMatrix[Double]] = None
 ) extends ParentVertexProperty
 
-val rand = scala.util.Random
-val nIn = 2+1  // number of features INCLUDING BIAS
-val nHid = 3  // number of neurons in hidden layer
-val nOut = 1  // dimension of label
-
 
 // -----------------------------------------------------------------------------
 // 1.1 -  create our single graph with both Data and Parameter vertices
 // -----------------------------------------------------------------------------
 
 // 1.1.1 - Create data vertices, annotated with features and labels
+
+// 1.1.1A - toy
+val rand = scala.util.Random
+val nIn = 2+1  // number of features INCLUDING BIAS
+val nHid = 3  // number of neurons in hidden layer
+val nOut = 1  // dimension of label
+
 val dataGraph: Graph[DataVertexProperty, Int] =
   GraphGenerators.logNormalGraph(sc, numVertices = 100).mapVertices( // obs: may have "recursive edges""
     (_, _) => {
@@ -63,6 +65,46 @@ val dataGraph: Graph[DataVertexProperty, Int] =
       DataVertexProperty(data)
     }
   )
+
+// 1.1.1B - trying from file
+val nIn = 50+1  // number of features INCLUDING BIAS
+val nHid = 512  // number of neurons in hidden layer
+val nOut = 121  // dimension of label
+
+val filePath = "/mnt/c/Users/danie/Desktop/ITA/CES27_distrProg/labExame/ppi/"
+val gJSON = spark.read.option("multiline", "true").json(filePath + "ppi-G.json")
+
+val classes = sc.textFile(filePath + "ppi-class_map.json").flatMap("\"\\d+\"\\:\\s?\\[(0|1|,|\\s)+\\]".r.findAllIn(_)).map(
+  x => {
+    val arr = ":\\s+".r.split(x)
+    val id = arr(0).replaceAll("\"", "").toLong
+    val labels = "\\d".r.findAllIn(arr(1)).map(y => y.toDouble).toArray
+    (id, labels)
+  }
+)
+
+// since the features file was in .npy format, I created a spark-friendly file w/ the script convert_features_file_ppi.py
+val otherFilePath = "/mnt/c/Users/danie/Desktop/ITA/CES27_distrProg/labExame/graphsage-on-graph/output_convert_features_file_ppi.txt"
+val features = sc.textFile(otherFilePath).map(
+  x => {
+    val arr = ";".r.split(x)
+    val id = arr(0).replaceAll("\"", "").toLong
+    val labels = "\\d".r.findAllIn(arr(1)).map(y => y.toDouble).toArray
+    (id, labels)
+  }
+)
+
+val dataVertices = gJSON.select("nodes").withColumn("nodes", explode(col("nodes"))).filter("nodes.test").rdd.map(
+  x => (x.getStruct(0).getLong(0), None) // x is a list of list in the form [[id,test,val]]
+).join(classes).map{case (id, (nothing, labels)) => (id, labels)}.join(features).map(
+  x => {
+    var data = new LearningData(
+      DenseVector(x._2._2.toList.union(List(1.0)).toArray[Double]), // features, where ".toList.union(List(1))" adds bias
+      DenseVector(x._2._1)  // label
+    )
+    (x._1, DataVertexProperty(data)) // RDD[VertexID, DataVertexProperty] equiv to VertexRDD[DataVertexProperty]
+  }
+)
   
 // 1.1.2 - Make the dataGraph undirected (in GraphX, this means duplicating+reversing all edges)
 var graph = Graph.apply(
