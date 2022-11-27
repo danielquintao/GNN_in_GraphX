@@ -94,17 +94,43 @@ val features = sc.textFile(otherFilePath).map(
   }
 )
 
-val dataVertices = gJSON.select("nodes").withColumn("nodes", explode(col("nodes"))).filter("nodes.test").rdd.map(
-  x => (x.getStruct(0).getLong(0), None) // x is a list of list in the form [[id,test,val]]
-).join(classes).map{case (id, (nothing, labels)) => (id, labels)}.join(features).map(
-  x => {
-    var data = new LearningData(
-      DenseVector(x._2._2.toList.union(List(1.0)).toArray[Double]), // features, where ".toList.union(List(1))" adds bias
-      DenseVector(x._2._1)  // label
-    )
-    (x._1, DataVertexProperty(data)) // RDD[VertexID, DataVertexProperty] equiv to VertexRDD[DataVertexProperty]
-  }
-)
+def verticesSubset(subset: String) = {
+  // subset may be "nodes.test", "nodes.val" or "NOT nodes.test AND NOT nodes.val"
+  // for test, validation and train subsets respectively
+  gJSON.select("nodes").withColumn("nodes", explode(col("nodes"))).filter(subset).rdd.map(
+    x => (x.getStruct(0).getLong(0), None) // x is a list of list in the form [[id,test,val]]
+  ).join(classes).map{case (id, (nothing, labels)) => (id, labels)}.join(features).map(
+    x => {
+      var data = new LearningData(
+        DenseVector(x._2._2.toList.union(List(1.0)).toArray[Double]), // features, where ".toList.union(List(1))" adds bias
+        DenseVector(x._2._1)  // label
+      )
+      (x._1, DataVertexProperty(data)) // RDD[VertexID, DataVertexProperty] equiv to VertexRDD[DataVertexProperty]
+    }
+  )
+}
+
+val trainVertices = verticesSubset("NOT nodes.test AND NOT nodes.val")
+val testVertices = verticesSubset("nodes.test")
+val valVertices = verticesSubset("nodes.val")
+
+def edgesSubset(vertices: RDD[(Long, DataVertexProperty)]) = {
+  // we keep edges where both ends belong to param vertices (e.g. both train vertices) -- INDUCTIVE learning
+  val filteredLeft = gJSON.select("links").withColumn("links", explode(col("links"))).rdd.map(
+    x => (x.getStruct(0).getLong(0), x.getStruct(0).getLong(1)) // x is a list of list in the form [[source, target]]
+  ).join(vertices).map{case (src, (dst, etc)) => (src, dst)}
+  val filteredRight = gJSON.select("links").withColumn("links", explode(col("links"))).rdd.map(
+    x => (x.getStruct(0).getLong(1), x.getStruct(0).getLong(0)) // NOTE WE SWAPED
+  ).join(vertices).map{case (dst, (src, etc)) => (src, dst)}
+  filteredLeft.intersection(filteredRight).map{case (src, dst) => new Edge[None.type] (src, dst)}
+  // fun-fact: for PPI data, by examining the variables above, it seems that the graph is actually undirected
+}
+
+
+val trainEdges = edgesSubset(trainVertices)
+val testEdges = edgesSubset(testVertices)
+val valEdges = edgesSubset(valVertices)
+
   
 // 1.1.2 - Make the dataGraph undirected (in GraphX, this means duplicating+reversing all edges)
 var graph = Graph.apply(
