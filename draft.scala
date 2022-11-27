@@ -1,7 +1,6 @@
 
 // =============================================================================
-// 1- load and parse dataset
-// For the moment, create a fake graph with fake features and labels
+// 0 - Imports
 // =============================================================================
 
 import org.apache.spark.graphx.{Graph, VertexId, PartitionStrategy, VertexRDD, Edge, PartitionID}
@@ -12,13 +11,145 @@ import breeze.linalg._
 import breeze.stats.distributions.Gaussian
 import scala.math.{log, exp, sqrt}
 
+
+// =============================================================================
+// 1 - Generation of our super graph with data nodes and parameter nodes
+// TODO Load and parse file with graph data
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// 1.0 - some definitions 
+// -----------------------------------------------------------------------------
+
+// language note: case classes extend Serializable by default (which we'll need)
+case class LearningData(var features: DenseVector[Double], var label: Double)
+
+trait ParentVertexProperty //! declaring ParentVertexProperty as a class does not work when spark tries to deserialize PArameterVertexProperty
+case class DataVertexProperty(
+  val data: LearningData // or val data: (DenseVector[Double], Double)
+) extends ParentVertexProperty
+case class ParameterVertexProperty(
+  var w1: Option[DenseMatrix[Double]] = None,
+  var w2: Option[DenseMatrix[Double]] = None,
+  // val lr: Double, //? do we need it?
+  // Variables for backpropagation:
+  var in: Option[DenseMatrix[Double]] = None,
+  var z1: Option[DenseMatrix[Double]] = None,
+  var a1: Option[DenseMatrix[Double]] = None,
+  var z2: Option[DenseMatrix[Double]] = None,
+  var a2: Option[DenseMatrix[Double]] = None
+) extends ParentVertexProperty
+
 val rand = scala.util.Random
 val nIn = 2+1  // number of features INCLUDING BIAS
 val nHid = 3  // number of neurons in hidden layer
 val nOut = 1  // dimension of label
 
+
+// -----------------------------------------------------------------------------
+// 1.1 -  create our single graph with both Data and Parameter vertices
+// -----------------------------------------------------------------------------
+
+// 1.1.1 - Create data vertices, annotated with features and labels
+val dataGraph: Graph[DataVertexProperty, Int] =
+  GraphGenerators.logNormalGraph(sc, numVertices = 100).mapVertices( // obs: may have "recursive edges""
+    (_, _) => {
+      var data = new
+        LearningData(
+          DenseVector.rand(nIn),
+          randomInt()  // 0 or 1
+        )
+      data.features(-1) = 1  // bias 
+      DataVertexProperty(data)
+    }
+  )
+  
+// 1.1.2 - Make the dataGraph undirected (in GraphX, this means duplicating+reversing all edges)
+var graph = Graph.apply(
+  vertices=dataGraph.vertices,
+  edges=dataGraph.edges.union(dataGraph.edges.reverse)
+)
+// Merge edges pointing in the same direction, specially if we already received some pairs A-B,B-A:
+//? (are we supposed to do this "deduplication" step or is the dataset a multigraph?)
+graph = graph.partitionBy(PartitionStrategy.CanonicalRandomVertexCut) // NOTE that groupEdges requires
+//                                                    a previous partitioning step to co-localize edges
+graph = graph.groupEdges{case (ed1, ed2) => ed1} // edges have no relevant annotation in our scenario,
+//                                                  so we simply take the first one 
+
+
+// 1.1.3 - Add parameter vertices where each has "batch-size" data->parameter edges.
+// A further improvement on the Routing Table (where GraphX says, for each vertex, in which partitions
+// we find its edges) is to use a constraint on the IDs of those data vertices that point toward the
+// the parameter vertex, e.g. that they are all congruent mod "nb partitions".
+val nPartitions = graph.edges.getNumPartitions
+val mixingPrime: VertexId = 1125899906842597L //* MUST BE THE SAME USED BY PartitionStrategy, c.f. https://github.com/apache/spark/blob/v3.3.1/graphx/src/main/scala/org/apache/spark/graphx/PartitionStrategy.scala
+val batchSize = 4 //TODO change to 512 with big dataset
+// 1.1.3.1 - The idea here is to have an RDD where each entry is a list of AT MOST batchSize vertices FROM THE SAME PARTITION
+// plus an "ID" computed as k*nPart + i, where 0 <= i < nPartitions is the partition where the vertices composing the
+// list are co-located and k is the counter of this list of vertices within the partition
+// (we will use this "ID" below to build the parameter Nodes and know which vertices point to it)
+var groupedVertices =  graph.vertices.map(x => (x._1 * mixingPrime % nPartitions, x._1)).
+                            groupByKey().
+                            map(x => (x._1, x._2.grouped(batchSize).toList)).
+                            flatMap(x => {
+                              for ((innerList, k) <- x._2.zipWithIndex) yield (k * nPartitions + x._1, innerList)
+                              }
+                            )
+// 1.1.3.2 - create the parameter vertices.
+val maxDataVertexId = graph.vertices.map(x => x._1).max
+// smallest multiple of nPartitions that doesn't coincide with any data vertex id:
+val parameterVertexOffset = nPartitions * (maxDataVertexId / nPartitions + 1)
+// create the parameter vertices properly said
+val vrdd: RDD[(VertexId, ParameterVertexProperty)] = groupedVertices.map(x => {
+    // Kaiming He initialization for layer with ReLU:
+    val gaussianSampler = Gaussian(0, sqrt(2.0 / nIn))
+    var w1 = DenseMatrix.tabulate(nIn, nHid){(i,j) => gaussianSampler.sample(1)(0)}
+    w1(-1, ::) := 0.0 // bias set to 0
+    // Xavier Glorot initialization for layer with sigmoid:
+    var w2 = (DenseMatrix.rand(nHid + 1, nOut) - 0.5) / sqrt(nHid + 1)
+    w2(-1, ::) := 0.0 // bias set to 0
+    val data = ParameterVertexProperty(Some(w1), Some(w2))
+    (x._1 + parameterVertexOffset, data)
+  }
+)
+val parameterVertices: VertexRDD[ParameterVertexProperty] = VertexRDD(vrdd)  // convert to VertexRDD format
+// 1.1.3.3 - build a new graph with both parameter and data nodes
+// convert property type of parameterVertices to ParentVectorProperty
+val pV: RDD[(VertexId, ParentVertexProperty)] = parameterVertices.map(x => (x._1, x._2.asInstanceOf[ParentVertexProperty]))
+var combinedGraph = Graph.apply(
+  // convert property type of vertices of graph (so far, these are data vertices) to ParentVectorProperty
+  // and merge with the parameter vertices recently converted to same type :)
+  vertices = pV.union(graph.mapVertices((vId, dataVP) => dataVP.asInstanceOf[ParentVertexProperty]).vertices),
+  // edges are the original data edges, and edges linking
+  edges = pV.map(x => (x._1 - parameterVertexOffset, x._2)).join(groupedVertices).flatMap(x => {
+    for (dataVertexId <- x._2._2) yield new Edge[None.type] (dataVertexId, x._1 + parameterVertexOffset)
+  }) ++ dataGraph.edges.map(x => new Edge[None.type](x.srcId, x.dstId))
+)
+
+// 1.1.4 - Partition the graph so that all edges point to the same node are together
+// (partition by dst vertex id)
+//! TODO test with and without this optim
+// we need to create our custom partition, co-locating edges with the same DESTINATION
+// (because of our use case, this seems the best option). 
+// We might try built-in CanonicalRandomVertexCut too (which is defined by GraphX itself).
+// Recall that we even build the parameter vertices with smart id numbers in order to improve even
+// further the partition (by co-locating parameter and data vertices)
+// NOTE: c.f. https://github.com/apache/spark/blob/v3.3.1/graphx/src/main/scala/org/apache/spark/graphx/PartitionStrategy.scala
+// to see how we define new Partitions (EdgePartition1D is the "dual" or our strategy, i.e. using src instead of dst)
+object PartitionOnDst extends PartitionStrategy {
+  override def getPartition(src: VertexId, dst: VertexId, numParts: PartitionID): PartitionID = {
+    val mixingPrime: VertexId = 1125899906842597L
+    (math.abs(dst * mixingPrime) % numParts).toInt
+  }
+}
+combinedGraph = combinedGraph.partitionBy(PartitionOnDst)
+
 // =============================================================================
-// 2- train a "common" NN before doing any GNN
+// 2 - Learn
+// =============================================================================
+
+// =============================================================================
+//* DEPRECATED Learn, useful for comparison and non-graph data
 // =============================================================================
 // training hyper-parameters
 val lr = 0.01 // learning rate
@@ -106,129 +237,5 @@ nn.forward(x, w1, w2, true)
 nn.backward(yt, w1, w2, true) // only works after the forward
 
 // =============================================================================
-// 3- Generation of our super graph with data nodes and parameter nodes
+// 3 - Test
 // =============================================================================
-
-// language note: case classes extend Serializable by default (which we'll need)
-
-case class LearningData(var features: DenseVector[Double], var label: Double)
-
-// some definitions //? do we need it?
-trait ParentVertexProperty //! declaring ParentVertexProperty as a class does not work when spark tries to deserialize PArameterVertexProperty
-case class DataVertexProperty(
-  val data: LearningData // or val data: (DenseVector[Double], Double)
-) extends ParentVertexProperty
-case class ParameterVertexProperty(
-  var w1: Option[DenseMatrix[Double]] = None,
-  var w2: Option[DenseMatrix[Double]] = None,
-  // val lr: Double, //? do we need it?
-  // Variables for backpropagation:
-  var in: Option[DenseMatrix[Double]] = None,
-  var z1: Option[DenseMatrix[Double]] = None,
-  var a1: Option[DenseMatrix[Double]] = None,
-  var z2: Option[DenseMatrix[Double]] = None,
-  var a2: Option[DenseMatrix[Double]] = None
-) extends ParentVertexProperty
-
-
-// -----------------------------------------------------------------------------
-// 3.1 create our single graph with both Data and Parameter vertices
-// -----------------------------------------------------------------------------
-
-// 3.1.1 - Create data vertices, annotated with features and labels
-val dataGraph: Graph[DataVertexProperty, Int] =
-  GraphGenerators.logNormalGraph(sc, numVertices = 100).mapVertices( // obs: may have "recursive edges""
-    (_, _) => {
-      var data = new
-        LearningData(
-          DenseVector.rand(nIn),
-          randomInt()  // 0 or 1
-        )
-      data.features(-1) = 1  // bias 
-      DataVertexProperty(data)
-    }
-  )
-  
-// 3.1.2 - Make the dataGraph undirected (in GraphX, this means duplicating+reversing all edges)
-var graph = Graph.apply(
-  vertices=dataGraph.vertices,
-  edges=dataGraph.edges.union(dataGraph.edges.reverse)
-)
-// Merge edges pointing in the same direction, specially if we already received some pairs A-B,B-A:
-//? (are we supposed to do this "deduplication" step or is the dataset a multigraph?)
-graph = graph.partitionBy(PartitionStrategy.CanonicalRandomVertexCut) // NOTE that groupEdges requires
-//                                                    a previous partitioning step to co-localize edges
-graph = graph.groupEdges{case (ed1, ed2) => ed1} // edges have no relevant annotation in our scenario,
-//                                                  so we simply take the first one 
-
-
-// 3.1.3 - Add parameter vertices where each has "batch-size" data->parameter edges.
-// A further improvement on the Routing Table (where GraphX says, for each vertex, in which partitions
-// we find its edges) is to use a constraint on the IDs of those data vertices that point toward the
-// the parameter vertex, e.g. that they are all congruent mod "nb partitions".
-val nPartitions = graph.edges.getNumPartitions
-val mixingPrime: VertexId = 1125899906842597L //* MUST BE THE SAME USED BY PartitionStrategy, c.f. https://github.com/apache/spark/blob/v3.3.1/graphx/src/main/scala/org/apache/spark/graphx/PartitionStrategy.scala
-val batchSize = 4 //TODO change to 512 with big dataset
-// 3.1.3.1 - The idea here is to have an RDD where each entry is a list of AT MOST batchSize vertices FROM THE SAME PARTITION
-// plus an "ID" computed as k*nPart + i, where 0 <= i < nPartitions is the partition where the vertices composing the
-// list are co-located and k is the counter of this list of vertices within the partition
-// (we will use this "ID" below to build the parameter Nodes and know which vertices point to it)
-var groupedVertices =  graph.vertices.map(x => (x._1 * mixingPrime % nPartitions, x._1)).
-                            groupByKey().
-                            map(x => (x._1, x._2.grouped(batchSize).toList)).
-                            flatMap(x => {
-                              for ((innerList, k) <- x._2.zipWithIndex) yield (k * nPartitions + x._1, innerList)
-                              }
-                            )
-// 3.1.3.2 - create the parameter vertices.
-val maxDataVertexId = graph.vertices.map(x => x._1).max
-// smallest multiple of nPartitions that doesn't coincide with any data vertex id:
-val parameterVertexOffset = nPartitions * (maxDataVertexId / nPartitions + 1)
-// create the parameter vertices properly said
-val vrdd: RDD[(VertexId, ParameterVertexProperty)] = groupedVertices.map(x => {
-    // Kaiming He initialization for layer with ReLU:
-    val gaussianSampler = Gaussian(0, sqrt(2.0 / nIn))
-    var w1 = DenseMatrix.tabulate(nIn, nHid){(i,j) => gaussianSampler.sample(1)(0)}
-    w1(-1, ::) := 0.0 // bias set to 0
-    // Xavier Glorot initialization for layer with sigmoid:
-    var w2 = (DenseMatrix.rand(nHid + 1, nOut) - 0.5) / sqrt(nHid + 1)
-    w2(-1, ::) := 0.0 // bias set to 0
-    val data = ParameterVertexProperty(Some(w1), Some(w2))
-    (x._1 + parameterVertexOffset, data)
-  }
-)
-val parameterVertices: VertexRDD[ParameterVertexProperty] = VertexRDD(vrdd)  // convert to VertexRDD format
-// 3.1.3.3 - build a new graph with both parameter and data nodes
-// convert property type of parameterVertices to ParentVectorProperty
-val pV: RDD[(VertexId, ParentVertexProperty)] = parameterVertices.map(x => (x._1, x._2.asInstanceOf[ParentVertexProperty]))
-var combinedGraph = Graph.apply(
-  // convert property type of vertices of graph (so far, these are data vertices) to ParentVectorProperty
-  // and merge with the parameter vertices recently converted to same type :)
-  vertices = pV.union(graph.mapVertices((vId, dataVP) => dataVP.asInstanceOf[ParentVertexProperty]).vertices),
-  // edges are the original data edges, and edges linking
-  edges = pV.map(x => (x._1 - parameterVertexOffset, x._2)).join(groupedVertices).flatMap(x => {
-    for (dataVertexId <- x._2._2) yield new Edge[None.type] (dataVertexId, x._1 + parameterVertexOffset)
-  }) ++ dataGraph.edges.map(x => new Edge[None.type](x.srcId, x.dstId))
-)
-
-// 3.1.4 - Partition the graph so that all edges point to the same node are together
-// (partition by dst vertex id)
-//! TODO test with and without this optim
-// we need to create our custom partition, co-locating edges with the same DESTINATION
-// (because of our use case, this seems the best option). 
-// We might try built-in CanonicalRandomVertexCut too (which is defined by GraphX itself).
-// Recall that we even build the parameter vertices with smart id numbers in order to improve even
-// further the partition (by co-locating parameter and data vertices)
-// NOTE: c.f. https://github.com/apache/spark/blob/v3.3.1/graphx/src/main/scala/org/apache/spark/graphx/PartitionStrategy.scala
-// to see how we define new Partitions (EdgePartition1D is the "dual" or our strategy, i.e. using src instead of dst)
-object PartitionOnDst extends PartitionStrategy {
-  override def getPartition(src: VertexId, dst: VertexId, numParts: PartitionID): PartitionID = {
-    val mixingPrime: VertexId = 1125899906842597L
-    (math.abs(dst * mixingPrime) % numParts).toInt
-  }
-}
-combinedGraph = combinedGraph.partitionBy(PartitionOnDst)
-
-
-//! ATTENTION it seems that GraphSage was made for undirected graphs, so we need to replicate all
-//! nodes in our **data** graph
