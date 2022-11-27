@@ -126,12 +126,15 @@ def edgesSubset(vertices: RDD[(Long, DataVertexProperty)]) = {
   // fun-fact: for PPI data, by examining the variables above, it seems that the graph is actually undirected
 }
 
-
 val trainEdges = edgesSubset(trainVertices)
 val testEdges = edgesSubset(testVertices)
 val valEdges = edgesSubset(valVertices)
 
-  
+var dataGraph = Graph.apply(  // actually train
+  vertices=trainVertices,
+  edges=trainEdges
+)
+
 // 1.1.2 - Make the dataGraph undirected (in GraphX, this means duplicating+reversing all edges)
 var graph = Graph.apply(
   vertices=dataGraph.vertices,
