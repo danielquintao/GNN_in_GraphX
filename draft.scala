@@ -3,7 +3,7 @@
 // 0 - Imports
 // =============================================================================
 
-import org.apache.spark.graphx.{Graph, VertexId, PartitionStrategy, VertexRDD, Edge, PartitionID}
+import org.apache.spark.graphx.{Graph, VertexId, PartitionStrategy, VertexRDD, Edge, PartitionID, EdgeTriplet}
 import org.apache.spark.graphx.util.GraphGenerators
 import org.apache.spark.rdd.RDD
 import scala.util.Random
@@ -22,7 +22,11 @@ import scala.math.{log, exp, sqrt}
 // -----------------------------------------------------------------------------
 
 // language note: case classes extend Serializable by default (which we'll need)
-case class LearningData(var features: DenseVector[Double], var label: DenseVector[Double]) //! CHANGED label FROM Double TO DenseVector
+case class LearningData(
+  var features: DenseVector[Double],
+  var label: DenseVector[Double], //! CHANGED label FROM Double TO DenseVector
+  var hiddenState: Option[DenseVector[Double]] = None
+)
 
 trait ParentVertexProperty //! declaring ParentVertexProperty as a class does not work when spark tries to deserialize PArameterVertexProperty
 case class DataVertexProperty(
@@ -154,7 +158,7 @@ graph = graph.groupEdges{case (ed1, ed2) => ed1} // edges have no relevant annot
 // the parameter vertex, e.g. that they are all congruent mod "nb partitions".
 val nPartitions = graph.edges.getNumPartitions
 val mixingPrime: VertexId = 1125899906842597L //* MUST BE THE SAME USED BY PartitionStrategy, c.f. https://github.com/apache/spark/blob/v3.3.1/graphx/src/main/scala/org/apache/spark/graphx/PartitionStrategy.scala
-val batchSize = 4 //TODO change to 512 with big dataset
+val batchSize = 512
 // 1.1.3.1 - The idea here is to have an RDD where each entry is a list of AT MOST batchSize vertices FROM THE SAME PARTITION
 // plus an "ID" computed as k*nPart + i, where 0 <= i < nPartitions is the partition where the vertices composing the
 // list are co-located and k is the counter of this list of vertices within the partition
@@ -174,7 +178,7 @@ val parameterVertexOffset = nPartitions * (maxDataVertexId / nPartitions + 1)
 val vrdd: RDD[(VertexId, ParameterVertexProperty)] = groupedVertices.map(x => {
     // Kaiming He initialization for layer with ReLU:
     val gaussianSampler = Gaussian(0, sqrt(2.0 / nIn))
-    var w1 = DenseMatrix.tabulate(nIn, nHid){(i,j) => gaussianSampler.sample(1)(0)}
+    var w1 = DenseMatrix.tabulate(nIn, nHid){(i,j) => gaussianSampler.sample(1)(0)} // TODO podemos simplificar isso pois vamos  onstruir w1,w2 exteriormente e enviar de qlqr forma
     w1(-1, ::) := 0.0 // bias set to 0
     // Xavier Glorot initialization for layer with sigmoid:
     var w2 = (DenseMatrix.rand(nHid + 1, nOut) - 0.5) / sqrt(nHid + 1)
@@ -218,6 +222,61 @@ combinedGraph = combinedGraph.partitionBy(PartitionOnDst)
 // =============================================================================
 // 2 - Learn
 // =============================================================================
+
+// Kaiming He initialization for layer with ReLU:
+// val gaussianSampler = Gaussian(0, sqrt(2.0 / nIn))
+// var w1 = DenseMatrix.tabulate(nIn, nHid){(i,j) => gaussianSampler.sample(1)(0)}
+//! 2 lines above don't work because spark tries to serialize GaussianSampler when we send w1 to the graph
+var w1 = DenseMatrix.rand(nIn, nHid) - 0.5 * DenseMatrix.ones[Double](nIn, nHid) // pretend Uniform[-0.5,0.5] is N(0,1)
+w1(-1, ::) := 0.0 // bias set to 0
+// Xavier Glorot initialization for layer with sigmoid:
+var w2 = (DenseMatrix.rand(nHid + 1, nOut) - 0.5) / sqrt(nHid + 1)
+w2(-1, ::) := 0.0 // bias set to 0
+
+for (step <- 0 to 100) {
+  // 0 - send consensus of the values of w1, w2 to the parameter nodes
+  // NOTE it is important to use mapVertices for performance
+  combinedGraph = combinedGraph.mapVertices(
+    (vid, content) => {
+      content match {
+        case c: ParameterVertexProperty =>
+          ParameterVertexProperty(Some(w1), Some(w2))
+        case _ => content
+      }
+    }
+  )
+
+  // 1 - Aggregate features of neighbors of each data vertex
+  combinedGraph = combinedGraph.pregel((DenseVector.zeros[Double](1),0.0), 2)(  // performs 2 iters because of Pregel implementation
+    // MESSAGE TYPE: (DenseVector[Double], Double)
+    // vertex program = how do the vetices update their state
+    (vid, content, arrivingHiddenState: (DenseVector[Double], Double)) => {
+      content match {
+        case c: DataVertexProperty =>
+          DataVertexProperty(
+            data=LearningData(
+              c.data.features,
+              c.data.label,
+              Some(arrivingHiddenState._1 / arrivingHiddenState._2) // mean of vectors := sum of vectors / cardinality
+            )
+          )
+        case _ => content
+      }
+    },
+    // sendMsg = code defining that each data vertex will send its parameters (i.e., how to compute the message)
+    (triplet: EdgeTriplet[ParentVertexProperty, None.type]) => {
+      triplet.srcAttr match {
+        case p: DataVertexProperty => Iterator((triplet.dstId, (p.data.features, 1.0)))
+        case _ => Iterator.empty
+      }
+    },
+    // mergeMsg = how to combine messaged in destiny
+    // in our case (sum of N vectors, N) + (sum of M vectors, M) => (sum of all N+M vectors, N+M)
+    // (sendMsg takes care of converting this into a mean)
+    (m1: (DenseVector[Double], Double), m2: (DenseVector[Double], Double)) => (m1._1 + m2._1, m1._2 + m2._2)
+  )
+
+}
 
 // =============================================================================
 //* DEPRECATED Learn, useful for comparison and non-graph data
