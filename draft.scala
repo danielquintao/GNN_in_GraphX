@@ -94,7 +94,7 @@ val features = sc.textFile(otherFilePath).map(
   x => {
     val arr = ";".r.split(x)
     val id = arr(0).replaceAll("\"", "").toLong
-    val labels = "\\d".r.findAllIn(arr(1)).map(y => y.toDouble).toArray
+    val labels = "\\d\\.\\d".r.findAllIn(arr(1)).map(y => y.toDouble).toArray
     (id, labels)
   }
 )
@@ -234,8 +234,7 @@ w1(-1, ::) := 0.0 // bias set to 0
 var w2 = (DenseMatrix.rand(nHid + 1, nOut) - 0.5) / sqrt(nHid + 1)
 w2(-1, ::) := 0.0 // bias set to 0
 
-val dumbVector = DenseVector.zeros[Double](1) // for classes with no zero-arg constructor
-val dumbMatrix = DenseMatrix.zeros[Double](1,1) // same as above
+val dumbMatrix = DenseMatrix.zeros[Double](0,0) // same as above
 
 // utility class for pregel algorithm in step 5 (data nodes send their and neighbors' states to parameter nodes)
 // case class DataMessage(state: DenseMatrix[Double], labels: DenseMatrix[Double])
@@ -254,7 +253,8 @@ for (step <- 0 to 100) {
   )
 
   // 1 - Aggregate features of neighbors of each data vertex
-  combinedGraph = combinedGraph.pregel((dumbVector,0.0), 2)(  // performs 2 iters because of Pregel implementation
+  combinedGraph = combinedGraph.pregel((DenseVector.zeros[Double](nIn/2),0.0), 2)(  // performs 2 iters because of Pregel implementation
+    // NOTE the nIn/2 in the initial message is important because of data nodes w/o neighbors
     // MESSAGE TYPE: (DenseVector[Double], Double)
     // vertex program = how do the vetices update their state
     (vid, content, arrivingHiddenState: (DenseVector[Double], Double)) => {
@@ -289,7 +289,15 @@ for (step <- 0 to 100) {
     // vertex program
     (vid, content, arrivingHiddenState: DenseMatrix[Double]) => {
       content match {
-        case c: ParameterVertexProperty => ParameterVertexProperty(c.w1, c.w2, Some(arrivingHiddenState))
+        case c: ParameterVertexProperty if c.w1.isDefined && arrivingHiddenState.cols > 0 => {
+          // the first condition (aka pattern guard) says that c.w1 is not None
+          // the second one is for the FIRST pregel step (the message is a dumb matrix 0 x 0 and we do nothing)
+          // Receive vertex features (concatenated to neighbors' aggregated features) and perform forward step:
+          val z1 = arrivingHiddenState * c.w1.get // FIXME using Option[..].get is not elegant, but ok for now
+          val a1 = z1.copy
+          a1(z1 <:< DenseMatrix.zeros[Double](z1.rows, z1.cols)) := 0.0 // ReLU
+          ParameterVertexProperty(c.w1, c.w2, Some(arrivingHiddenState), Some(z1), Some(a1))
+        }
         case _ => content
       }
     },
@@ -302,7 +310,8 @@ for (step <- 0 to 100) {
               val stateToSend = p.data.hiddenState match {
                 case Some(v) => DenseVector.vertcat(p.data.features, v)
                 case None => DenseVector.vertcat(p.data.features, DenseVector.zeros[Double](p.data.features.size))
-                  // this second case may happen if a data vertex has no in-neighbors...
+                  // this second case might happen if a data vertex has no in-neighbors, but we set the hidden state to
+                  // a vector of zeros in the previous learning step anyway (step 1)
               }
               Iterator((triplet.dstId, DenseMatrix(stateToSend)))
             }
@@ -317,6 +326,9 @@ for (step <- 0 to 100) {
     (m1: DenseMatrix[Double], m2: DenseMatrix[Double]) =>
       DenseMatrix.vertcat(m1, m2) // stack states
   )
+
+  // TODO check why some param vectors have indegree > batchSize: combinedGraph.inDegrees.join(combinedGraph.vertices.filter(_._2.isInstanceOf[ParameterVertexProperty])).map(x => x._2._1).take(100)
+
 
 }
 
