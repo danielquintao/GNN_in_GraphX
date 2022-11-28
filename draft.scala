@@ -42,6 +42,7 @@ case class ParameterVertexProperty(
   var a1: Option[DenseMatrix[Double]] = None,
   var z2: Option[DenseMatrix[Double]] = None,
   var a2: Option[DenseMatrix[Double]] = None
+                                  // TODO VAI PRECISAR ACRESCENTAR AS LABELS P FAZER BACKPROP
 ) extends ParentVertexProperty
 
 
@@ -51,27 +52,27 @@ case class ParameterVertexProperty(
 
 // 1.1.1 - Create data vertices, annotated with features and labels
 
-// 1.1.1A - toy
-val rand = scala.util.Random
-val nIn = 2+1  // number of features INCLUDING BIAS
-val nHid = 3  // number of neurons in hidden layer
-val nOut = 1  // dimension of label
-
-val dataGraph: Graph[DataVertexProperty, Int] =
-  GraphGenerators.logNormalGraph(sc, numVertices = 100).mapVertices( // obs: may have "recursive edges""
-    (_, _) => {
-      var data = new
-        LearningData(
-          DenseVector.rand(nIn),
-          randomInt()  // 0 or 1
-        )
-      data.features(-1) = 1  // bias 
-      DataVertexProperty(data)
-    }
-  )
+//// 1.1.1A - toy
+//val rand = scala.util.Random
+//val nIn = 2*(2+1)  // number of features INCLUDING BIAS and multiplying by 2 for the concatenation in GraphSAGE
+//val nHid = 3  // number of neurons in hidden layer
+//val nOut = 1  // dimension of label
+//
+//val dataGraph: Graph[DataVertexProperty, Int] =
+//  GraphGenerators.logNormalGraph(sc, numVertices = 100).mapVertices( // obs: may have "recursive edges""
+//    (_, _) => {
+//      var data = new
+//        LearningData(
+//          DenseVector.rand(nIn),
+//          randomInt()  // 0 or 1
+//        )
+//      data.features(-1) = 1  // bias
+//      DataVertexProperty(data)
+//    }
+//  )
 
 // 1.1.1B - trying from file
-val nIn = 50+1  // number of features INCLUDING BIAS
+val nIn = 2 * (50 + 1)  // number of features INCLUDING BIAS, multiplying by 2 for the concatenation in GraphSAGE
 val nHid = 512  // number of neurons in hidden layer
 val nOut = 121  // dimension of label
 
@@ -233,6 +234,12 @@ w1(-1, ::) := 0.0 // bias set to 0
 var w2 = (DenseMatrix.rand(nHid + 1, nOut) - 0.5) / sqrt(nHid + 1)
 w2(-1, ::) := 0.0 // bias set to 0
 
+val dumbVector = DenseVector.zeros[Double](1) // for classes with no zero-arg constructor
+val dumbMatrix = DenseMatrix.zeros[Double](1,1) // same as above
+
+// utility class for pregel algorithm in step 5 (data nodes send their and neighbors' states to parameter nodes)
+// case class DataMessage(state: DenseMatrix[Double], labels: DenseMatrix[Double])
+
 for (step <- 0 to 100) {
   // 0 - send consensus of the values of w1, w2 to the parameter nodes
   // NOTE it is important to use mapVertices for performance
@@ -247,7 +254,7 @@ for (step <- 0 to 100) {
   )
 
   // 1 - Aggregate features of neighbors of each data vertex
-  combinedGraph = combinedGraph.pregel((DenseVector.zeros[Double](1),0.0), 2)(  // performs 2 iters because of Pregel implementation
+  combinedGraph = combinedGraph.pregel((dumbVector,0.0), 2)(  // performs 2 iters because of Pregel implementation
     // MESSAGE TYPE: (DenseVector[Double], Double)
     // vertex program = how do the vetices update their state
     (vid, content, arrivingHiddenState: (DenseVector[Double], Double)) => {
@@ -274,6 +281,41 @@ for (step <- 0 to 100) {
     // in our case (sum of N vectors, N) + (sum of M vectors, M) => (sum of all N+M vectors, N+M)
     // (sendMsg takes care of converting this into a mean)
     (m1: (DenseVector[Double], Double), m2: (DenseVector[Double], Double)) => (m1._1 + m2._1, m1._2 + m2._2)
+  )
+
+  // 2 - Each data node send data to the corresponding parameter node
+  combinedGraph = combinedGraph.pregel(dumbMatrix, 2)(
+    // MESSAGE TYPE: DenseMatrix[Double]
+    // vertex program
+    (vid, content, arrivingHiddenState: DenseMatrix[Double]) => {
+      content match {
+        case c: ParameterVertexProperty => ParameterVertexProperty(c.w1, c.w2, Some(arrivingHiddenState))
+        case _ => content
+      }
+    },
+    // sendMsg
+    (triplet: EdgeTriplet[ParentVertexProperty, None.type]) => {
+      triplet.srcAttr match {
+        case p: DataVertexProperty => {
+          triplet.dstAttr match {
+            case q: ParameterVertexProperty => {
+              val stateToSend = p.data.hiddenState match {
+                case Some(v) => DenseVector.vertcat(p.data.features, v)
+                case None => DenseVector.vertcat(p.data.features, DenseVector.zeros[Double](p.data.features.size))
+                  // this second case may happen if a data vertex has no in-neighbors...
+              }
+              Iterator((triplet.dstId, DenseMatrix(stateToSend)))
+            }
+            case _ => Iterator.empty // no data vertex to data vertex message
+          }
+        }
+        case _ => Iterator.empty
+      }
+    },
+    // mergeMsg
+    // we will take to DataMessage objects and stack their vectors, which is not nice but we must do it
+    (m1: DenseMatrix[Double], m2: DenseMatrix[Double]) =>
+      DenseMatrix.vertcat(m1, m2) // stack states
   )
 
 }
