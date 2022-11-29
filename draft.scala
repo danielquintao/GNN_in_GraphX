@@ -41,7 +41,8 @@ case class ParameterVertexProperty(
   var z1: Option[DenseMatrix[Double]] = None,
   var a1: Option[DenseMatrix[Double]] = None,
   var z2: Option[DenseMatrix[Double]] = None,
-  var a2: Option[DenseMatrix[Double]] = None
+  var a2: Option[DenseMatrix[Double]] = None,
+  var row2DataVertexId: Option[DenseVector[VertexId]] = None
                                   // TODO VAI PRECISAR ACRESCENTAR AS LABELS P FAZER BACKPROP
 ) extends ParentVertexProperty
 
@@ -284,19 +285,19 @@ for (step <- 0 to 100) {
   )
 
   // 2 - Each data node send data to the corresponding parameter node
-  combinedGraph = combinedGraph.pregel(dumbMatrix, 2)(
-    // MESSAGE TYPE: DenseMatrix[Double]
+  combinedGraph = combinedGraph.pregel((dumbMatrix, DenseVector.zeros[VertexId](0)), 2)(
+    // MESSAGE TYPE: (DenseMatrix[Double], DenseVector[VertexId])
     // vertex program
-    (vid, content, arrivingHiddenState: DenseMatrix[Double]) => {
+    (vid, content, arrivingHiddenState: (DenseMatrix[Double], DenseVector[VertexId])) => {
       content match {
-        case c: ParameterVertexProperty if c.w1.isDefined && arrivingHiddenState.cols > 0 => {
+        case c: ParameterVertexProperty if c.w1.isDefined && arrivingHiddenState._1.cols > 0 => {
           // the first condition (aka pattern guard) says that c.w1 is not None
           // the second one is for the FIRST pregel step (the message is a dumb matrix 0 x 0 and we do nothing)
           // Receive vertex features (concatenated to neighbors' aggregated features) and perform forward step:
-          val z1 = arrivingHiddenState * c.w1.get // FIXME using Option[..].get is not elegant, but ok for now
+          val z1 = arrivingHiddenState._1 * c.w1.get // FIXME using Option[..].get is not elegant, but ok for now
           val a1 = z1.copy
           a1(z1 <:< DenseMatrix.zeros[Double](z1.rows, z1.cols)) := 0.0 // ReLU
-          ParameterVertexProperty(c.w1, c.w2, Some(arrivingHiddenState), Some(z1), Some(a1))
+          ParameterVertexProperty(c.w1, c.w2, Some(arrivingHiddenState._1), Some(z1), Some(a1), None, None, Some(arrivingHiddenState._2))
         }
         case _ => content
       }
@@ -313,7 +314,7 @@ for (step <- 0 to 100) {
                   // this second case might happen if a data vertex has no in-neighbors, but we set the hidden state to
                   // a vector of zeros in the previous learning step anyway (step 1)
               }
-              Iterator((triplet.dstId, DenseMatrix(stateToSend)))
+              Iterator((triplet.dstId, (DenseMatrix(stateToSend), DenseVector(triplet.srcId))))
             }
             case _ => Iterator.empty // no data vertex to data vertex message
           }
@@ -323,12 +324,13 @@ for (step <- 0 to 100) {
     },
     // mergeMsg
     // we will take to DataMessage objects and stack their vectors, which is not nice but we must do it
-    (m1: DenseMatrix[Double], m2: DenseMatrix[Double]) =>
-      DenseMatrix.vertcat(m1, m2) // stack states
+    (m1: (DenseMatrix[Double], DenseVector[VertexId]), m2: (DenseMatrix[Double], DenseVector[VertexId])) =>
+      (DenseMatrix.vertcat(m1._1, m2._1), DenseVector.vertcat(m1._2, m2._2)) // stack states
   )
 
   // TODO check why some param vectors have indegree > batchSize: combinedGraph.inDegrees.join(combinedGraph.vertices.filter(_._2.isInstanceOf[ParameterVertexProperty])).map(x => x._2._1).take(100)
 
+  // 3 - update data vertices with parameter a1 stored in parameter vectors, so we can do the second forward step later
 
 }
 
