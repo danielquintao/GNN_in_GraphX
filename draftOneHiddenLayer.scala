@@ -71,7 +71,7 @@ case class ParameterVertexProperty(
 val nIn = 2 * (50 + 1)  // number of features INCLUDING BIAS, multiplying by 2 for the concatenation in GraphSAGE
 val nOut = 121  // dimension of label
 
-val filePath = "/mnt/c/Users/danie/Desktop/ITA/CES27_distrProg/labExame/ppi/"
+val filePath = "/mnt/c/Users/danie/Desktop/ITA/CES27_distrProg/labExame/graphsage-on-graph/data/"
 val gJSON = spark.read.option("multiline", "true").json(filePath + "ppi-G.json")
 
 val classes = sc.textFile(filePath + "ppi-class_map.json").flatMap("\"\\d+\"\\:\\s?\\[(0|1|,|\\s)+\\]".r.findAllIn(_)).map(
@@ -84,7 +84,7 @@ val classes = sc.textFile(filePath + "ppi-class_map.json").flatMap("\"\\d+\"\\:\
 )
 
 // since the features file was in .npy format, I created a spark-friendly file w/ the script convert_features_file_ppi.py
-val otherFilePath = "/mnt/c/Users/danie/Desktop/ITA/CES27_distrProg/labExame/graphsage-on-graph/output_convert_features_file_ppi.txt"
+val otherFilePath = "/mnt/c/Users/danie/Desktop/ITA/CES27_distrProg/labExame/graphsage-on-graph/data/output_convert_features_file_ppi.txt"
 val features = sc.textFile(otherFilePath).map(
   x => {
     val arr = ";".r.split(x)
@@ -225,7 +225,7 @@ val dumbMatrix = DenseMatrix.zeros[Double](0,0) // same as above
 // utility class for pregel algorithm (data nodes send their and neighbors' states to parameter nodes)
 case class DataMessage(state: DenseMatrix[Double], labels: DenseMatrix[Double])
 
-for (step <- 0 to 5) {
+for (step <- 0 to 15) {
   // 0 - send consensus of the values of w1 to the parameter nodes
   // NOTE it is important to use mapVertices for performance
   combinedGraph = combinedGraph.mapVertices(
@@ -345,7 +345,7 @@ for (step <- 0 to 5) {
     }
   }.map(x => (1, (x, 1.0))).reduceByKey((a,b) => (a._1 + b._1, a._2 + b._2)).map(x => x._2._1 / x._2._2).take(1)(0)
 
-  // 4- compute mean loss!
+  // 4- compute mean loss and accuracy!
   val loss = combinedGraph.vertices.filter(_._2.isInstanceOf[ParameterVertexProperty]).map {
     case (vid: VertexId, ParameterVertexProperty(Some(_), Some(in), Some(_), Some(a1), Some(gt))) => {
       // compute loss (BCE, ok for 1 class or multi-category)
@@ -354,10 +354,15 @@ for (step <- 0 to 5) {
       sum(l) / l.size.toDouble // accumulated
     }
   }.map(x => (1, (x, 1.0))).reduceByKey((a,b) => (a._1 + b._1, a._2 + b._2)).map(x => x._2._1 / x._2._2).take(1)(0)
-  println(loss)
+
+  val acc = combinedGraph.vertices.filter(_._2.isInstanceOf[ParameterVertexProperty]).map {
+    case (vid: VertexId, ParameterVertexProperty(Some(_), Some(in), Some(_), Some(a1), Some(gt))) => {
+      // compute acc (negation of a1 > 0.5 XOR gt, converting stuff to boolean or to double as needed)
+      val l = (!((a1 >:> 0.5) ^^ gt.mapValues(x => x == 1.0))).mapValues(x => if(x){1.0}else{0.0})
+      sum(l) / l.size.toDouble // accumulated
+    }
+  }.map(x => (1, (x, 1.0))).reduceByKey((a,b) => (a._1 + b._1, a._2 + b._2)).map(x => x._2._1 / x._2._2).take(1)(0)
+
+  println(loss, acc)
 
 }
-
-// =============================================================================
-// 3 - Test
-// =============================================================================
