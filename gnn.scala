@@ -10,6 +10,7 @@ import scala.util.Random
 import breeze.linalg._
 import breeze.stats.distributions.Gaussian
 import scala.math.{log, exp, sqrt}
+import System.nanoTime
 
 
 // =============================================================================
@@ -225,7 +226,9 @@ val dumbMatrix = DenseMatrix.zeros[Double](0,0) // same as above
 // utility class for pregel algorithm (data nodes send their and neighbors' states to parameter nodes)
 case class DataMessage(state: DenseMatrix[Double], labels: DenseMatrix[Double])
 
-for (step <- 0 to 15) {
+for (step <- 0 to 9) {
+  val initTime = nanoTime()
+
   // 0 - send consensus of the values of w1 to the parameter nodes
   // NOTE it is important to use mapVertices for performance
   combinedGraph = combinedGraph.mapVertices(
@@ -345,7 +348,10 @@ for (step <- 0 to 15) {
     }
   }.map(x => (1, (x, 1.0))).reduceByKey((a,b) => (a._1 + b._1, a._2 + b._2)).map(x => x._2._1 / x._2._2).take(1)(0)
 
-  // 4- compute mean loss and accuracy!
+  // 4- measure time
+  val delta = nanoTime() - initTime
+
+  // 5- compute mean loss and accuracy!
   val loss = combinedGraph.vertices.filter(_._2.isInstanceOf[ParameterVertexProperty]).map {
     case (vid: VertexId, ParameterVertexProperty(Some(_), Some(in), Some(_), Some(a1), Some(gt))) => {
       // compute loss (BCE, ok for 1 class or multi-category)
@@ -363,6 +369,6 @@ for (step <- 0 to 15) {
     }
   }.map(x => (1, (x, 1.0))).reduceByKey((a,b) => (a._1 + b._1, a._2 + b._2)).map(x => x._2._1 / x._2._2).take(1)(0)
 
-  println(loss, acc)
+  println(loss, acc, delta)
 
 }
